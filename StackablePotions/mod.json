@@ -1,0 +1,40 @@
+{
+  "$schema": "../config-schema.json",
+  "name": "Stackable Potions",
+  "description": "Potions stack in one inventory cell, like keys. Potions you pick up join a stack you already carry.",
+  "author": "Juan",
+  "website": "https://github.com/Juan-Pablo-Barrientos/d2r-stackable-potions",
+  "version": "0.1.0",
+  "config": [
+    {
+      "id": "maxStack",
+      "type": "number",
+      "name": "Stack size",
+      "description": "The most potions one stack can hold (2 to 511).",
+      "defaultValue": 50,
+      "minValue": 2,
+      "maxValue": 511
+    },
+    {
+      "id": "autoStack",
+      "type": "checkbox",
+      "name": "Stack on pickup",
+      "description": "A potion you pick up joins a matching stack in your inventory, like keys.",
+      "defaultValue": true
+    },
+    {
+      "id": "rejuvenation",
+      "type": "checkbox",
+      "name": "Rejuvenation potions",
+      "description": "Rejuvenation and Full Rejuvenation potions stack too.",
+      "defaultValue": true
+    },
+    {
+      "id": "otherPotions",
+      "type": "checkbox",
+      "name": "Stamina, Antidote and Thawing potions",
+      "description": "These potions stack too.",
+      "defaultValue": true
+    }
+  ]
+}

@@ -1,0 +1,28 @@
+Stackable Potions
+=================
+
+Potions stack like keys. This zip has two parts, and you need both. Each goes
+in a different place:
+
+  d2rl-stackable-potions.dll   The plugin. Drinking from a stack uses one
+                               potion, and loose potions merge into stacks.
+  StackablePotions\            The D2RMM mod. It makes potions stackable.
+
+1. Install D2RLoader (https://d2rloader.net).
+
+2. Copy d2rl-stackable-potions.dll into
+   <Diablo II Resurrected folder>\d2rloader\plugins\
+   D2RMM can't put files there, so this step is done by hand. D2RMM
+   reinstalls don't touch it. Copy it again only when the plugin updates.
+
+3. Copy the StackablePotions folder into D2RMM's mods folder. In D2RMM,
+   enable Stackable Potions, choose your settings, and click Install Mods.
+
+4. Start the game with D2RLoader using D2RMM's output mod (for example, set
+   default_mod = "D2RMM" in d2rloader\config\d2rloader.toml).
+
+To check it works, open d2rloader\logs\stackable-potions.log. You should see
+"19 of 19 potions stack".
+
+Source and details:
+https://github.com/Juan-Pablo-Barrientos/d2r-stackable-potions
