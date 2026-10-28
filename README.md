@@ -63,9 +63,11 @@ dropping a stack never gives potions back:
 - **Inventory:** the stack has to vanish within two seconds of a plain
   right-click, with no left-click since. Ctrl, Shift and Alt clicks don't
   count.
-- **Belt:** the stack has to vanish without turning up anywhere else. If
-  several items vanish at once, or the belt itself is gone (death), nothing
-  is put back.
+- **Belt:** the stack has to vanish without turning up anywhere else.
+  Pressing several belt keys at once works: each stack is put back in its
+  own column, one after another. If two items vanish from the same column,
+  something other than a belt potion vanishes with them, or the belt itself
+  is removed or swapped (death too), nothing is put back.
 
 It works in single player and when you host a TCP/IP game. It does nothing
 when you join someone else's game, because only the host can change items.

@@ -27,7 +27,7 @@ static constexpr D2RL::PluginInfo StackablePotionsPluginInfo {
 	.abiVersion  = D2RL_PLUGIN_ABI_VERSION,
 	.id          = "stackable-potions",
 	.name        = "Stackable Potions",
-	.version     = "0.1.0",
+	.version     = "0.2.0",
 	.author      = "Juan",
 	.description = "Drinking from a potion stack uses one potion, and loose potions merge into stacks.",
 	.flags       = D2RL::PluginFlags::Client,
@@ -75,6 +75,8 @@ static constexpr ULONGLONG RightClickWindowMs = 2'000;
 // competes with a manual move, Potion Refill or Inventory Sort.
 static constexpr ULONGLONG MergeSettleMs    = 1'500;
 static constexpr ULONGLONG GameQueueRetryMs = 2'000;
+// A belt stack that cannot get the cursor this long goes to the inventory.
+static constexpr ULONGLONG CursorWaitMs     = 1'000;
 
 struct Config {
 	bool enabled    = true;
@@ -111,7 +113,16 @@ struct Snapshot {
 	bool         overflow = false;
 	bool         beltUsed[BeltSlots] {};
 	bool         cursorUsed = false;
-	bool         beltWorn   = false;
+	// The equipped belt's runtime id, 0 without a belt.
+	uint32_t     beltId     = 0;
+};
+
+// A drunk belt stack waiting for the cursor. Only one restored stack can be on
+// the cursor at a time, so drinks from several columns are put back one by one.
+struct PendingRestore {
+	StoredPotion drunk;
+	int          maxRow = 0;
+	ULONGLONG    since  = 0;
 };
 
 static const D2RL::PluginContext*    plugin;
@@ -155,9 +166,9 @@ static uint64_t           failedMergeSignature;
 // updates and must not look like drinks.
 static uint32_t           mergedIds[D2RL::Items::MaxTransactionInputs];
 static uint32_t           mergedIdCount;
-// Set once a belt has been seen at BeltBodyLocation, so a wrong location can
-// never block belt restores.
 static bool               beltSeen;
+static PendingRestore     pendingRestores[BeltSlots];
+static int                pendingRestoreCount;
 
 static void Logf(bool warning, const char* format, ...) noexcept {
 	char    message[256] {};
@@ -432,7 +443,13 @@ static auto Capture(D2RL::PlayerHandle player, Snapshot* snapshot) noexcept -> b
 	}
 
 	D2RL::ItemHandle belt = D2RL::InvalidItemHandle;
-	snapshot->beltWorn    = inventory->getEquippedItem(plugin, player, BeltBodyLocation, &belt) == D2RL::Inventory::Result::Success && belt != D2RL::InvalidItemHandle;
+	snapshot->beltId      = 0;
+	if (inventory->getEquippedItem(plugin, player, BeltBodyLocation, &belt) == D2RL::Inventory::Result::Success && belt != D2RL::InvalidItemHandle) {
+		D2RL::Items::ItemInfo info { .structSize = D2RL::Items::ItemInfoSize };
+		if (items->getItemInfo(plugin, belt, &info) == D2RL::Items::Result::Success) {
+			snapshot->beltId = info.runtimeId;
+		}
+	}
 
 	D2RL::ItemHandle cursor = D2RL::InvalidItemHandle;
 	if (inventory->getCursorItem(plugin, player, &cursor) == D2RL::Inventory::Result::Success && cursor != D2RL::InvalidItemHandle) {
@@ -497,10 +514,19 @@ static auto CreateStack(D2RL::PlayerHandle player, const StoredPotion& potion, u
 	return result;
 }
 
+// The highest row of a belt column that holds a potion.
+static auto TopRow(const Snapshot& snapshot, int column) noexcept -> int {
+	int maxRow = 0;
+	for (int row = 0; row < BeltRows; ++row) {
+		maxRow = snapshot.beltUsed[row * BeltColumns + column] ? row : maxRow;
+	}
+	return maxRow;
+}
+
 // A free belt slot in the drunk potion's column that the belt is known to have:
 // the drunk slot itself, or the lowest free row up to the highest row that held
 // a potion before the drink (the column shifts down after a drink).
-static auto FreeBeltSlot(const StoredPotion& drunk, const Snapshot& now) noexcept -> int {
+static auto FreeBeltSlot(const StoredPotion& drunk, int maxRow, const Snapshot& now) noexcept -> int {
 	const int drunkSlot = BeltSlot(drunk.x, drunk.y);
 	if (drunkSlot < 0) {
 		return -1;
@@ -509,10 +535,6 @@ static auto FreeBeltSlot(const StoredPotion& drunk, const Snapshot& now) noexcep
 		return drunkSlot;
 	}
 	const int column = drunkSlot % BeltColumns;
-	int       maxRow = 0;
-	for (int row = 0; row < BeltRows; ++row) {
-		maxRow = previous.beltUsed[row * BeltColumns + column] ? row : maxRow;
-	}
 	for (int row = 0; row <= maxRow; ++row) {
 		if (!now.beltUsed[row * BeltColumns + column]) {
 			return row * BeltColumns + column;
@@ -523,8 +545,9 @@ static auto FreeBeltSlot(const StoredPotion& drunk, const Snapshot& now) noexcep
 
 // The item service cannot create items in the belt, so a drunk belt stack is
 // created on the cursor and the server is asked to put it in a free slot of the
-// same column. A drunk inventory stack goes back to the cell it used.
-static void RestoreStack(D2RL::PlayerHandle player, const StoredPotion& drunk, const Snapshot& now) noexcept {
+// same column. A drunk inventory stack goes back to the cell it used. Returns
+// true when the restored stack took the cursor.
+static auto RestoreStack(D2RL::PlayerHandle player, const StoredPotion& drunk, int maxRow, const Snapshot& now, bool cursorFree) noexcept -> bool {
 	using D2RL::Items::ItemContainer;
 	using D2RL::Items::Placement;
 
@@ -532,12 +555,14 @@ static void RestoreStack(D2RL::PlayerHandle player, const StoredPotion& drunk, c
 	char           code[5] {};
 	auto           result = D2RL::Items::Result::Unsupported;
 	const char*    where  = "";
+	bool           onCursor = false;
 
 	if (drunk.container == ItemContainer::Belt) {
-		const int slot = FreeBeltSlot(drunk, now);
-		if (slot >= 0 && sendPacket != nullptr && !now.cursorUsed) {
+		const int slot = FreeBeltSlot(drunk, maxRow, now);
+		if (slot >= 0 && sendPacket != nullptr && cursorFree) {
 			D2RL::ItemHandle handle = D2RL::InvalidItemHandle;
 			result                  = CreateStack(player, drunk, quantity, ItemContainer::Cursor, Placement::Automatic, 0, 0, &handle);
+			onCursor                = result == D2RL::Items::Result::Success;
 			D2RL::Items::ItemInfo info { .structSize = D2RL::Items::ItemInfoSize };
 			if (result == D2RL::Items::Result::Success && items->getItemInfo(plugin, handle, &info) == D2RL::Items::Result::Success) {
 				beltPlacement = { info.runtimeId, static_cast<uint32_t>(slot) };
@@ -563,35 +588,96 @@ static void RestoreStack(D2RL::PlayerHandle player, const StoredPotion& drunk, c
 	} else if (config.logActions) {
 		Logf(false, "Drank one %s from a stack of %d; put %u back in the %s.", CodeText(drunk.code, code), drunk.quantity, quantity, where);
 	}
+	return onCursor;
 }
 
-// One potion stack of two or more vanished from the belt or inventory without
-// showing up anywhere else. Several items vanishing at once (death, a belt being
-// removed) is ignored, and so is a belt stack that left with the belt itself
-// (dying with a single stack in the belt). An inventory stack also needs a
-// plain right-click.
+static auto IsDrunkStack(const StoredPotion& potion) noexcept -> bool {
+	return potion.quantity >= 2 && StackLimit(potion.code) > 1;
+}
+
+// Potions that vanished from the belt or inventory without showing up anywhere
+// else. Each belt hotkey drinks from its own column, so pressing 1 and 2
+// together can empty two columns in one update. Anything else vanishing at the
+// same time, or the belt itself leaving (death, removing or swapping it), means
+// it was not a drink. An inventory stack also needs a plain right-click.
+// Returns true when a stack is being restored.
 static auto DetectDrink(D2RL::PlayerHandle player, const Snapshot& now, ULONGLONG time) noexcept -> bool {
+	using D2RL::Items::ItemContainer;
+
 	if (previous.overflow || now.overflow) {
 		return false;
 	}
-	const StoredPotion* drunk    = nullptr;
-	int                 vanished = 0;
+	const StoredPotion* vanished[BeltColumns] {};
+	int                 vanishedCount = 0;
 	for (int index = 0; index < previous.count; ++index) {
 		const StoredPotion& potion = previous.potions[index];
 		if (Find(now, potion.runtimeId) != nullptr || WasMerged(potion.runtimeId)) {
 			continue;
 		}
-		++vanished;
-		if (potion.quantity >= 2 && StackLimit(potion.code) > 1
-		    && (potion.container == D2RL::Items::ItemContainer::Belt || (potion.container == D2RL::Items::ItemContainer::Inventory && RecentRightClick(time)))) {
-			drunk = &potion;
+		if (vanishedCount == BeltColumns) {
+			return false;
 		}
+		vanished[vanishedCount++] = &potion;
 	}
-	if (vanished != 1 || drunk == nullptr || (drunk->container == D2RL::Items::ItemContainer::Belt && beltSeen && !now.beltWorn)) {
+	if (vanishedCount == 0) {
 		return false;
 	}
-	RestoreStack(player, *drunk, now);
-	return true;
+
+	if (vanishedCount == 1 && vanished[0]->container == ItemContainer::Inventory) {
+		if (!IsDrunkStack(*vanished[0]) || !RecentRightClick(time)) {
+			return false;
+		}
+		RestoreStack(player, *vanished[0], 0, now, false);
+		return true;
+	}
+
+	bool columnUsed[BeltColumns] {};
+	for (int index = 0; index < vanishedCount; ++index) {
+		const int slot = vanished[index]->container == ItemContainer::Belt ? BeltSlot(vanished[index]->x, vanished[index]->y) : -1;
+		if (slot < 0 || columnUsed[slot % BeltColumns] || previous.beltId != now.beltId) {
+			if (config.logActions && vanishedCount > 1) {
+				Logf(false, "%d potions vanished at once, not from separate belt columns. Not a drink.", vanishedCount);
+			}
+			return false;
+		}
+		columnUsed[slot % BeltColumns] = true;
+	}
+
+	bool queued = false;
+	for (int index = 0; index < vanishedCount; ++index) {
+		const StoredPotion& drunk = *vanished[index];
+		if (!IsDrunkStack(drunk)) {
+			continue;
+		}
+		const int maxRow = TopRow(previous, BeltSlot(drunk.x, drunk.y) % BeltColumns);
+		if (pendingRestoreCount == BeltSlots) {
+			RestoreStack(player, drunk, maxRow, now, false);
+		} else {
+			pendingRestores[pendingRestoreCount++] = { drunk, maxRow, time };
+		}
+		queued = true;
+	}
+	return queued;
+}
+
+// Puts back the queued belt stacks, one per update while the cursor is free.
+// Returns true while stacks are still waiting.
+static auto RestorePending(D2RL::PlayerHandle player, const Snapshot& now, ULONGLONG time) noexcept -> bool {
+	bool cursorFree = !now.cursorUsed;
+	while (pendingRestoreCount > 0) {
+		const PendingRestore next = pendingRestores[0];
+		if (!cursorFree && time - next.since < CursorWaitMs) {
+			return true;
+		}
+		for (int index = 1; index < pendingRestoreCount; ++index) {
+			pendingRestores[index - 1] = pendingRestores[index];
+		}
+		--pendingRestoreCount;
+		if (RestoreStack(player, next.drunk, next.maxRow, now, cursorFree)) {
+			cursorFree = false;
+		}
+	}
+	return false;
 }
 
 // ---- Merging loose potions ------------------------------------------------
@@ -705,18 +791,20 @@ static void __cdecl GameTick(const D2RL::PluginContext*, void*) noexcept {
 	gameTickQueued = false;
 	const D2RL::PlayerHandle player = localPlayer.load();
 	if (player == D2RL::InvalidPlayerHandle) {
-		haveSnapshot = false;
+		haveSnapshot        = false;
+		pendingRestoreCount = 0;
 		return;
 	}
 	if (player != snapshotPlayer) {
-		haveSnapshot   = false;
-		snapshotPlayer = player;
+		haveSnapshot        = false;
+		pendingRestoreCount = 0;
+		snapshotPlayer      = player;
 	}
 	RefreshStackLimits();
 	if (!Capture(player, &current)) {
 		return;
 	}
-	if (!beltSeen && current.beltWorn) {
+	if (!beltSeen && current.beltId != 0) {
 		beltSeen = true;
 		plugin->LogInfo("Found the equipped belt. Belt stacks lost on death are not restored.");
 	}
@@ -727,8 +815,9 @@ static void __cdecl GameTick(const D2RL::PluginContext*, void*) noexcept {
 		inventorySignature = signature;
 		inventoryChangedAt = time;
 	}
-	const bool restored = haveSnapshot && DetectDrink(player, current, time);
-	if (!restored && config.mergeLoose) {
+	const bool drunk     = haveSnapshot && DetectDrink(player, current, time);
+	const bool restoring = RestorePending(player, current, time);
+	if (!drunk && !restoring && config.mergeLoose) {
 		MergeLoosePotions(player, current, time);
 	}
 	previous     = current;
@@ -847,7 +936,8 @@ D2RL_PLUGIN_EXPORT auto D2RLoaderLoadPlugin(const D2RL::PluginContext* context) 
 }
 
 D2RL_PLUGIN_EXPORT void D2RLoaderUnloadPlugin() noexcept {
-	uiLoopRunning  = false;
-	haveSnapshot   = false;
-	gameTickQueued = false;
+	uiLoopRunning       = false;
+	haveSnapshot        = false;
+	gameTickQueued      = false;
+	pendingRestoreCount = 0;
 }
